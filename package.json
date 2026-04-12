@@ -1,0 +1,40 @@
+{
+  "name": "based-agent",
+  "description": "Your Agent Isn't Bad. Your System Is. — An opinionated blueprint for building serious agents.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "example:minimal": "tsx --env-file=.env examples/minimal-agent/src/index.ts",
+    "example:coding": "tsx --env-file=.env examples/coding-agent/src/index.ts",
+    "example:research": "tsx --env-file=.env examples/research-agent/src/index.ts",
+    "template:starter": "tsx --env-file=.env templates/starter-agent/src/index.ts",
+    "template:researcher": "tsx --env-file=.env templates/researcher/src/index.ts",
+    "template:codebase": "tsx --env-file=.env templates/codebase-agent/src/index.ts",
+    "template:pipeline": "tsx --env-file=.env templates/pipeline-agent/src/index.ts",
+    "template:orchestrator": "tsx --env-file=.env templates/orchestrator/src/index.ts"
+  },
+  "dependencies": {
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "tsup": "^8.0.0",
+    "vitest": "^1.6.0",
+    "tsx": "^4.7.0",
+    "@types/node": "^20.0.0"
+  },
+  "engines": {
+    "node": ">=20.6.0",
+    "npm": ">=10.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mikestangdevs/based-agent.git"
+  }
+}
+

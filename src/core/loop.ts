@@ -26,10 +26,14 @@ import type {
 import { toolResultMessage, userMessage } from '../types.js'
 import type { ToolRegistry } from '../tools/index.js'
 import type { PermissionPolicy } from '../permissions/index.js'
+import type { ApprovalHandler } from '../permissions/approval.js'
 import type { MemoryContext } from '../memory/index.js'
 import type { ContextManager } from '../context/index.js'
 import type { PromptBuilder } from '../prompts/index.js'
+import type { EventLogger } from '../telemetry/index.js'
+import { createRunContext } from './run-context.js'
 import { UnknownToolError } from './errors.js'
+import { DEFAULT_SYSTEM_PROMPT } from '../prompts/defaults.js'
 
 export type AgentConfig = {
   /** Tool registry with all available tools */
@@ -65,11 +69,32 @@ export type AgentConfig = {
    * Override to point tools at a specific project directory.
    */
   workingDirectory?: string
+
+  /**
+   * Handler for `ask`-tier permission decisions.
+   * When a tool requires approval, this is called before execution.
+   * If not set, `ask` falls back to fail-closed deny.
+   *
+   * Built-ins: CliApprovalHandler (interactive), AutoApproveHandler (CI/tests)
+   */
+  approvalHandler?: ApprovalHandler
+
+  /**
+   * Event logger — called for every AgentEvent before it is yielded.
+   * Wire to ConsoleLogger, NdJsonLogger, or your observability stack.
+   */
+  logger?: EventLogger
+
+  /**
+   * Maximum cumulative token budget for this run (input + output tokens combined).
+   * When exceeded, the loop yields `done: budget_exceeded` and halts.
+   * Prevents runaway costs from misconfigured agents or adversarial prompts.
+   */
+  tokenBudget?: number
 }
 
-const DEFAULT_INSTRUCTIONS = `You are a capable, focused agent. You use tools to accomplish tasks.
-You prefer targeted actions over broad ones. You ask before doing anything destructive.
-When a task is complete, stop — do not keep working unnecessarily.`
+// Production-grade behavioral contract. Override via AgentConfig.baseInstructions.
+const DEFAULT_INSTRUCTIONS = DEFAULT_SYSTEM_PROMPT
 
 /**
  * Core agent loop. Returns an async generator of typed events.
@@ -102,9 +127,23 @@ async function* agentLoop(
     baseInstructions = DEFAULT_INSTRUCTIONS,
     maxIterations = parseInt(process.env['BASED_AGENT_MAX_ITERATIONS'] ?? '100', 10),
     maxTokens = parseInt(process.env['BASED_AGENT_MAX_TOKENS'] ?? '8192', 10),
+    approvalHandler,
+    logger,
+    tokenBudget,
   } = config
 
   const workingDirectory = config.workingDirectory ?? process.cwd()
+  const runCtx = createRunContext(params.task)
+
+  /** Emit an event — calls logger then yields to the caller */
+  async function* emit(event: AgentEvent): AsyncGenerator<AgentEvent> {
+    try {
+      await logger?.onEvent(runCtx.runId, event)
+    } catch {
+      // Logger errors must never crash the agent run
+    }
+    yield event
+  }
 
   // Build the initial system prompt
   const systemPrompt = prompts.build({
@@ -130,16 +169,26 @@ async function* agentLoop(
 
   let iteration = 0
   let nearLimitEmitted = false
+  let cumulativeTokens = 0
+  // Circuit breaker: track consecutive failures per tool name
+  const consecutiveFailures: Record<string, number> = {}
+  const CIRCUIT_BREAKER_THRESHOLD = 3
 
   while (true) {
     // --- Safety checks ---
     if (iteration >= maxIterations) {
-      yield { type: 'done', reason: 'max_iterations' as TerminationReason }
+      yield* emit({ type: 'done', reason: 'max_iterations' as TerminationReason })
       return
     }
 
     if (params.signal?.aborted) {
-      yield { type: 'done', reason: 'user_abort' as TerminationReason }
+      yield* emit({ type: 'done', reason: 'user_abort' as TerminationReason })
+      return
+    }
+
+    // Token budget check
+    if (tokenBudget !== undefined && cumulativeTokens >= tokenBudget) {
+      yield* emit({ type: 'done', reason: 'budget_exceeded' as TerminationReason })
       return
     }
 
@@ -147,17 +196,17 @@ async function* agentLoop(
     if (context.needsCompaction()) {
       const before = context.getTokenCount()
       const compacted = await context.compact('sliding_window', messages)
-      messages.splice(1, messages.length - 1, ...compacted) // preserve first user message
+      messages.splice(1, messages.length - 1, ...compacted)
       const after = context.getTokenCount()
-      nearLimitEmitted = false // reset after compaction
-      yield { type: 'context_compacted', beforeTokens: before, afterTokens: after }
+      nearLimitEmitted = false
+      yield* emit({ type: 'context_compacted', beforeTokens: before, afterTokens: after })
     } else if (!nearLimitEmitted && context.isNearLimit()) {
       nearLimitEmitted = true
-      yield { type: 'context_near_limit', tokenCount: context.getTokenCount(), limit: context.getMaxTokens() }
+      yield* emit({ type: 'context_near_limit', tokenCount: context.getTokenCount(), limit: context.getMaxTokens() })
     }
 
     iteration++
-    yield { type: 'model_request_start', iteration }
+    yield* emit({ type: 'model_request_start', iteration })
 
     // --- Call the model ---
     let finalResponse = null
@@ -177,28 +226,30 @@ async function* agentLoop(
         } else if (event.type === 'message_complete') {
           finalResponse = event.response
           context.track({ role: 'assistant', content: event.response.content })
+          // Accumulate token spend for budget enforcement
+          cumulativeTokens += event.response.usage.inputTokens + event.response.usage.outputTokens
         }
       }
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error))
-      yield { type: 'error', error: err }
-      yield { type: 'done', reason: 'error' as TerminationReason }
+      yield* emit({ type: 'error', error: err })
+      yield* emit({ type: 'done', reason: 'error' as TerminationReason })
       return
     }
 
     if (!finalResponse) {
-      yield { type: 'done', reason: 'error' as TerminationReason }
+      yield* emit({ type: 'done', reason: 'error' as TerminationReason })
       return
     }
 
-    yield { type: 'model_response', response: finalResponse }
+    yield* emit({ type: 'model_response', response: finalResponse })
 
     // --- Append assistant response to history ---
     messages.push({ role: 'assistant', content: finalResponse.content })
 
     // --- No tool calls → we're done ---
     if (!finalResponse.toolUses || finalResponse.toolUses.length === 0) {
-      yield { type: 'done', reason: 'end_turn' as TerminationReason }
+      yield* emit({ type: 'done', reason: 'end_turn' as TerminationReason })
       return
     }
 
@@ -206,7 +257,7 @@ async function* agentLoop(
     const toolResults: ToolResultContent[] = []
 
     for (const toolUse of finalResponse.toolUses) {
-      yield { type: 'tool_request', toolUse }
+      yield* emit({ type: 'tool_request', toolUse })
 
       // Look up the tool
       const tool = tools.get(toolUse.name)
@@ -231,7 +282,13 @@ async function* agentLoop(
       })
 
       if (permissionDecision.behavior === 'deny') {
-        yield { type: 'permission_denied', toolName: toolUse.name, reason: permissionDecision.reason }
+        yield* emit({
+          type: 'permission_denied' as const,
+          toolName: toolUse.name,
+          reason: permissionDecision.reason,
+          ...(permissionDecision.riskTier !== undefined ? { riskTier: permissionDecision.riskTier } : {}),
+          ...(permissionDecision.rollbackGuidance !== undefined ? { rollbackGuidance: permissionDecision.rollbackGuidance } : {}),
+        })
         toolResults.push({
           type: 'tool_result',
           tool_use_id: toolUse.id,
@@ -242,21 +299,33 @@ async function* agentLoop(
       }
 
       if (permissionDecision.behavior === 'ask') {
-        // In v0.1, there is no interactive approval handler.
-        // Treat 'ask' as 'deny' — fail-closed.
-        // Full interactive approval flow is a v0.2 feature.
-        yield {
-          type: 'permission_denied',
-          toolName: toolUse.name,
-          reason: `Approval required: ${permissionDecision.reason}`,
+        // Route to ApprovalHandler if registered; otherwise fail-closed.
+        const outcome = approvalHandler
+          ? await approvalHandler.approve(
+              { tool: toolUse.name, input: toolUse.input, readOnly: tool.readOnly, destructive: tool.destructive ?? false, context: { iteration, messages } },
+              permissionDecision.reason,
+            )
+          : 'deny'
+
+        if (outcome === 'deny') {
+          yield* emit({
+            type: 'permission_denied' as const,
+            toolName: toolUse.name,
+            reason: approvalHandler
+              ? `Approval denied by handler: ${permissionDecision.reason}`
+              : `Approval required but no handler registered: ${permissionDecision.reason}`,
+            ...(permissionDecision.riskTier !== undefined ? { riskTier: permissionDecision.riskTier } : {}),
+            ...(permissionDecision.rollbackGuidance !== undefined ? { rollbackGuidance: permissionDecision.rollbackGuidance } : {}),
+          })
+          toolResults.push({
+            type: 'tool_result',
+            tool_use_id: toolUse.id,
+            content: `Permission denied: ${permissionDecision.reason}`,
+            is_error: true,
+          })
+          continue
         }
-        toolResults.push({
-          type: 'tool_result',
-          tool_use_id: toolUse.id,
-          content: `Permission denied: approval required but no interactive handler is configured. Reason: ${permissionDecision.reason}`,
-          is_error: true,
-        })
-        continue
+        // outcome === 'allow' — fall through to execution below
       }
 
       // Execute the tool
@@ -267,12 +336,15 @@ async function* agentLoop(
         })
         const output = context.truncateResult(result.output, tool.maxResultSizeChars)
 
-        yield {
+        // Success — reset circuit breaker for this tool
+        consecutiveFailures[toolUse.name] = 0
+
+        yield* emit({
           type: 'tool_result',
           toolUseId: toolUse.id,
           output,
           isError: false,
-        }
+        })
         toolResults.push({
           type: 'tool_result',
           tool_use_id: toolUse.id,
@@ -281,18 +353,28 @@ async function* agentLoop(
         })
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err)
-        yield {
+
+        // Circuit breaker — count consecutive failures for this tool
+        consecutiveFailures[toolUse.name] = (consecutiveFailures[toolUse.name] ?? 0) + 1
+        const failures = consecutiveFailures[toolUse.name]!
+
+        yield* emit({
           type: 'tool_result',
           toolUseId: toolUse.id,
           output: errMsg,
           isError: true,
-        }
+        })
         toolResults.push({
           type: 'tool_result',
           tool_use_id: toolUse.id,
           content: errMsg,
           is_error: true,
         })
+
+        if (failures >= CIRCUIT_BREAKER_THRESHOLD) {
+          yield* emit({ type: 'done', reason: 'repeated_tool_failure' as TerminationReason })
+          return
+        }
       }
     }
 

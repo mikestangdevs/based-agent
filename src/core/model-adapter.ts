@@ -448,6 +448,14 @@ export class OpenAIAdapter implements ModelAdapter {
           let event: Record<string, unknown>
           try { event = JSON.parse(data) as Record<string, unknown> } catch { continue }
 
+          // OpenAI sends usage in a final chunk with choices:[] — parse it first
+          // before the choices guard so we don't skip it.
+          const usageRaw = event['usage'] as { prompt_tokens?: number; completion_tokens?: number } | undefined
+          if (usageRaw) {
+            inputTokens = usageRaw.prompt_tokens ?? inputTokens
+            outputTokens = usageRaw.completion_tokens ?? outputTokens
+          }
+
           const choices = event['choices'] as Array<{
             delta?: {
               content?: string
@@ -487,12 +495,6 @@ export class OpenAIAdapter implements ModelAdapter {
           if (choice.finish_reason) {
             stopReason = choice.finish_reason === 'tool_calls' ? 'tool_use' : 'end_turn'
           }
-
-          const usage = event['usage'] as { prompt_tokens?: number; completion_tokens?: number } | undefined
-          if (usage) {
-            inputTokens = usage.prompt_tokens ?? 0
-            outputTokens = usage.completion_tokens ?? 0
-          }
         }
       }
     } finally {
@@ -519,9 +521,22 @@ export class OpenAIAdapter implements ModelAdapter {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Auto-discovery factory
-// ---------------------------------------------------------------------------
+/**
+ * Strip surrounding single or double quotes from a string.
+ * Node's --env-file does not strip quotes the way shell dotenv parsers do.
+ * A value stored as OPENAI_API_KEY="sk-..." arrives with literal quote characters.
+ */
+function stripEnvQuotes(value: string | undefined): string | undefined {
+  if (!value) return value
+  const trimmed = value.trim()
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1)
+  }
+  return trimmed
+}
 
 /**
  * Creates a model adapter based on available API keys.
@@ -537,9 +552,13 @@ export function createModelAdapter(options?: {
   if (options?.provider === 'anthropic') return new AnthropicAdapter(options)
   if (options?.provider === 'openai') return new OpenAIAdapter(options)
 
-  // Auto-detect from environment
-  if (process.env['ANTHROPIC_API_KEY']) return new AnthropicAdapter(options)
-  if (process.env['OPENAI_API_KEY']) return new OpenAIAdapter(options)
+  // Auto-detect from environment — strip quotes in case the .env file used quoted values
+  const anthropicKey = stripEnvQuotes(process.env['ANTHROPIC_API_KEY'])
+  const openaiKey = stripEnvQuotes(process.env['OPENAI_API_KEY'])
+
+  if (anthropicKey) return new AnthropicAdapter({ ...options, apiKey: anthropicKey })
+  if (openaiKey) return new OpenAIAdapter({ ...options, apiKey: openaiKey })
 
   throw new NoModelKeyError()
 }
+

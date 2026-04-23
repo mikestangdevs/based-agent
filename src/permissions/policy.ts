@@ -83,7 +83,13 @@ export class PermissionPolicy {
           behavior = this.options.nonInteractiveDefault
         }
 
-        return { behavior, reason: rule.reason, ruleName: rule.name }
+        return {
+          behavior,
+          reason: rule.reason,
+          ruleName: rule.name,
+          ...(rule.riskTier !== undefined ? { riskTier: rule.riskTier } : {}),
+          ...(rule.rollbackGuidance !== undefined ? { rollbackGuidance: rule.rollbackGuidance } : {}),
+        }
       }
     }
 
@@ -97,6 +103,7 @@ export class PermissionPolicy {
       reason: 'No explicit rule matched — defaulting to ' + defaultBehavior,
     }
   }
+
 
   /**
    * List all registered rules (for debugging).

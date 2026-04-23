@@ -19,6 +19,11 @@ Most agent frameworks make it easy to call a model. Few of them tell you what to
      │  │ manager  │  │  manager   │  │   builder   │   │
      │  └──────────┘  └────────────┘  └─────────────┘   │
      │                                                  │
+     │  ┌──────────┐  ┌────────────┐  ┌─────────────┐   │
+     │  │telemetry │  │  approval  │  │  run context │   │
+     │  │  logger  │  │  handler   │  │   (run ID)   │   │
+     │  └──────────┘  └────────────┘  └─────────────┘   │
+     │                                                  │
      │               ┌────────────┐                     │
      │               │   model    │                     │
      │               │  adapter   │                     │
@@ -26,7 +31,7 @@ Most agent frameworks make it easy to call a model. Few of them tell you what to
      └──────────────────────────────────────────────────┘
 ```
 
-Every serious agent has these seven systems — whether they were designed explicitly or accumulated accidentally. This repo makes them explicit.
+Every serious agent has these seven systems — whether they were designed explicitly or accumulated accidentally. This repo makes them explicit, then adds the production-grade infrastructure layer on top.
 
 ---
 
@@ -41,6 +46,16 @@ Every serious agent has these seven systems — whether they were designed expli
 | Subagents | `src/orchestration/` | Task delegation with context boundaries and depth limits |
 | Context | `src/context/` | Token budgeting, sliding window compaction, result truncation |
 | Prompts | `src/prompts/` | Layered composition: instructions → tools → memory → runtime → task |
+
+## Production Infrastructure
+
+| System | Source | What it does |
+|---|---|---|
+| Run Identity | `src/core/run-context.ts` | UUID per run, propagated to every event — enables log correlation and audit trails |
+| ApprovalHandler | `src/permissions/approval.ts` | Live human-in-the-loop approval for `ask`-tier tools (CLI, webhook, auto-approve for CI) |
+| EventLogger | `src/telemetry/` | Tap point for every `AgentEvent` — wire to Datadog, LangSmith, NDJSON pipelines, etc. |
+| Token Budget | `AgentConfig.tokenBudget` | Hard cost ceiling — loop halts with `budget_exceeded` before costs run away |
+| Circuit Breaker | `src/core/loop.ts` | Auto-halts with `repeated_tool_failure` if the same tool errors 3× in a row |
 
 ---
 
@@ -118,10 +133,18 @@ const prompts = new PromptBuilder()
 // 6. Model — which provider and model to use
 const model = createModelAdapter()  // auto-detects from env
 
-// 7. Loop — everything wired together
-const agent = createAgent({ tools, permissions, memory, context, prompts, model })
+// 7. Loop — everything wired together, with enterprise options
+const agent = createAgent({
+  tools, permissions, memory, context, prompts, model,
+
+  // Production infrastructure (all optional, all backward-compatible)
+  approvalHandler: new CliApprovalHandler(), // ask-tier tools → interactive y/N prompt
+  logger: new ConsoleLogger(),               // structured JSON on every event → stderr
+  tokenBudget: 100_000,                      // hard token ceiling → done: budget_exceeded
+})
 
 // Run and handle typed events
+// Every event carries a runId for log correlation
 for await (const event of agent.run({ task: 'Summarize the README' })) {
   if (event.type === 'model_response') {
     const text = event.response.content
@@ -130,7 +153,7 @@ for await (const event of agent.run({ task: 'Summarize the README' })) {
       .join('')
     if (text) process.stdout.write(text)
   }
-  if (event.type === 'tool_request')   console.log(`  → ${event.toolUse.name}`)
+  if (event.type === 'tool_request')    console.log(`  → ${event.toolUse.name}`)
   if (event.type === 'permission_denied') console.log(`  ✗ Blocked: ${event.reason}`)
   if (event.type === 'context_near_limit') console.log(`  ⚠ Context at ${event.tokenCount}/${event.limit} tokens`)
   if (event.type === 'done') break
@@ -214,15 +237,62 @@ Every state transition — model request, tool call, permission denial, context 
 { type: 'model_response',       response: AssistantResponse }
 { type: 'tool_request',         toolUse: ToolUseBlock }
 { type: 'tool_result',          output: string; isError: boolean }
-{ type: 'permission_denied',    toolName: string; reason: string }
+{ type: 'permission_denied',    toolName: string; reason: string; riskTier?: RiskTier }
 { type: 'context_near_limit',   tokenCount: number; limit: number }
 { type: 'context_compacted',    beforeTokens: number; afterTokens: number }
 { type: 'done',                 reason: TerminationReason }
+// done reasons: 'end_turn' | 'max_iterations' | 'budget_exceeded' |
+//               'repeated_tool_failure' | 'user_abort' | 'error'
 ```
 
-**Permissions are fail-closed.**
+Plug any logger into the `EventLogger` interface and receive every event with a `runId` for correlation:
 
-Destructive tools (`file_write`, `shell_exec`) require explicit approval by default. No rule → no execution. Subagents can be given a more restrictive policy than the parent. The permission layer is checked before every single tool call.
+```typescript
+// Structured JSON to stderr — pipe into Datadog, Splunk, CloudWatch
+const agent = createAgent({ ...config, logger: new ConsoleLogger() })
+
+// NDJSON to a file or queue
+const agent = createAgent({ ...config, logger: new NdJsonLogger(fs.createWriteStream('run.ndjson')) })
+
+// Custom
+class LangfuseLogger implements EventLogger {
+  onEvent(runId: string, event: AgentEvent) {
+    langfuse.trace({ id: runId, ...event })
+  }
+}
+```
+
+**Permissions are fail-closed, with live approval for `ask`-tier tools.**
+
+Destructive tools (`file_write`, `shell_exec`) require explicit approval by default. No rule → no execution. Subagents can be given a more restrictive policy than the parent. Wire an `ApprovalHandler` to make `ask`-tier tools interactive:
+
+```typescript
+// Interactive y/N in the terminal
+new CliApprovalHandler()
+
+// Always approve — for CI pipelines where all tools are pre-trusted
+new AutoApproveHandler()
+
+// Custom — POST to Slack, a web UI, a queue
+class SlackApprovalHandler implements ApprovalHandler {
+  async approve(request, reason): Promise<'allow' | 'deny'> {
+    await slack.post(`Approve ${request.tool}? Reason: ${reason}`)
+    return waitForSlackResponse()
+  }
+}
+```
+
+**Cost guardrails built in.**
+
+Set `tokenBudget` in `AgentConfig` and the loop hard-stops with `done: budget_exceeded` before costs run away. A circuit breaker halts with `done: repeated_tool_failure` if the same tool errors 3× in a row — preventing infinite retry spirals.
+
+```typescript
+const agent = createAgent({
+  ...config,
+  tokenBudget: 50_000,   // hard ceiling — ~$0.15 on gpt-4o
+  maxIterations: 100,    // backstop safety valve
+})
+```
 
 **Security containment on all file tools.**
 
@@ -247,6 +317,7 @@ based-agent/
 │   ├── types.ts                  # Shared types: messages, events, responses
 │   ├── core/
 │   │   ├── loop.ts               # Agent loop + AgentConfig
+│   │   ├── run-context.ts        # RunContext — UUID per run for log correlation
 │   │   ├── model-adapter.ts      # AnthropicAdapter, OpenAIAdapter, createModelAdapter
 │   │   └── errors.ts             # Typed error hierarchy
 │   ├── tools/
@@ -260,7 +331,10 @@ based-agent/
 │   │       └── web-search.ts     # readOnly, pluggable provider
 │   ├── permissions/
 │   │   ├── policy.ts             # PermissionPolicy, allow/deny/ask rules
-│   │   └── rules.ts              # Default built-in rules
+│   │   ├── rules.ts              # Default built-in rules
+│   │   └── approval.ts          # ApprovalHandler — CliApprovalHandler, AutoApproveHandler
+│   ├── telemetry/
+│   │   └── types.ts              # EventLogger — ConsoleLogger, NdJsonLogger
 │   ├── memory/
 │   │   └── loader.ts             # 4-layer discovery, budget trimming
 │   ├── context/
@@ -279,7 +353,10 @@ based-agent/
 │   ├── researcher/               # Multi-step research
 │   ├── codebase-agent/           # Scoped file access
 │   ├── pipeline-agent/           # Batch / CI mode
-│   └── orchestrator/             # Multi-role subagent orchestration
+│   ├── orchestrator/             # Multi-role subagent orchestration
+│   └── verification-agent/       # Adversarial CI testing with structured exit codes
+├── scripts/
+│   └── test-enterprise.ts        # End-to-end integration tests (real API calls)
 └── docs/                         # One doc per system (01-loop → 07-prompts)
 ```
 
@@ -291,8 +368,18 @@ The model is not the problem. The model has been good for a while.
 
 The problem is that most frameworks treat everything around the model as configuration — a few `maxTokens` here, a system prompt there. When the agent fails in production, there's nothing to debug because there was nothing designed.
 
-This repo is the alternative. Each of the 7 systems is an explicit module with a typed interface, a documented rationale, a test suite, and a real implementation. Everything is independently replaceable. Nothing is magic.
+This repo is the alternative. Each of the 7 systems is an explicit module with a typed interface, a documented rationale, a test suite, and a real implementation. The production infrastructure layer (telemetry, approval, cost guardrails, circuit breaking) is built on top of those same interfaces — not bolted on. Everything is independently replaceable. Nothing is magic.
 
+---
+
+## Testing
+
+```bash
+npm test                # Unit tests (78 tests, mocked model)
+npm run test:enterprise # Integration tests (4 scenarios, real API calls)
+```
+
+The integration tests exercise: run identity (UUID correlation), EventLogger (structured JSON), ApprovalHandler (ask → approve flow), and token budget enforcement. They require a valid `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` in `.env`.
 
 ---
 

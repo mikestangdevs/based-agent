@@ -11,6 +11,15 @@
 
 export type PermissionBehavior = 'allow' | 'deny' | 'ask'
 
+/**
+ * Three-tier risk model — maps to the blast radius and reversibility of an action.
+ *
+ *   low:    local, reversible, narrow scope        → proceed freely
+ *   medium: shared code paths, recoverable         → document rollback path
+ *   high:   production systems, broad/irreversible → require explicit confirmation
+ */
+export type RiskTier = 'low' | 'medium' | 'high'
+
 export type PermissionRequest = {
   /** Name of the tool being called */
   tool: string
@@ -48,6 +57,19 @@ export type PermissionDecision = {
 
   /** Which rule triggered this decision (for debugging) */
   ruleName?: string
+
+  /**
+   * Risk tier of the requested operation.
+   * Populated when the matching rule carries risk metadata.
+   * Callers can use this to render appropriate warnings or require extra approval.
+   */
+  riskTier?: RiskTier
+
+  /**
+   * Optional rollback guidance for medium/high-risk operations.
+   * Surfaced to the user when behavior is 'ask'.
+   */
+  rollbackGuidance?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -73,6 +95,18 @@ export type PermissionRule = {
    * Default: 0
    */
   priority?: number
+
+  /**
+   * Risk tier carried by this rule.
+   * Propagated into PermissionDecision.riskTier when the rule matches.
+   */
+  riskTier?: RiskTier
+
+  /**
+   * Optional rollback or recovery guidance for medium/high-risk operations.
+   * Surfaced to the user when behavior is 'ask'.
+   */
+  rollbackGuidance?: string
 }
 
 // ---------------------------------------------------------------------------

@@ -6,6 +6,7 @@
  *
  * Import from the root barrel ('based-agent') rather than this file directly.
  */
+import type { RiskTier } from './permissions/types.js'
 
 // ---------------------------------------------------------------------------
 // Messages
@@ -85,18 +86,28 @@ export type AgentEvent =
   | { type: 'model_response'; response: AssistantResponse }
   | { type: 'tool_request'; toolUse: ToolUseBlock }
   | { type: 'tool_result'; toolUseId: string; output: string; isError: boolean }
-  | { type: 'permission_denied'; toolName: string; reason: string }
+  | {
+      type: 'permission_denied'
+      toolName: string
+      reason: string
+      /** Risk tier of the blocked operation, if classified */
+      riskTier?: RiskTier
+      /** Rollback or recovery guidance for medium/high risk blocks */
+      rollbackGuidance?: string
+    }
   | { type: 'context_near_limit'; tokenCount: number; limit: number }
   | { type: 'context_compacted'; beforeTokens: number; afterTokens: number }
   | { type: 'error'; error: Error }
   | { type: 'done'; reason: TerminationReason }
 
 export type TerminationReason =
-  | 'end_turn'        // Model indicated it is done
-  | 'max_iterations'  // Hit safety limit
-  | 'budget_exhausted' // Token budget exhausted
-  | 'user_abort'      // AbortController fired
-  | 'error'           // Unrecoverable error
+  | 'end_turn'             // Model indicated it is done
+  | 'max_iterations'       // Hit safety limit
+  | 'budget_exhausted'     // Token budget exhausted (legacy alias)
+  | 'budget_exceeded'      // Token budget exceeded
+  | 'user_abort'           // AbortController fired
+  | 'error'                // Unrecoverable error
+  | 'repeated_tool_failure' // Same tool failed 3+ consecutive times (circuit breaker)
 
 // ---------------------------------------------------------------------------
 // Agent run params

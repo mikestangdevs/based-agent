@@ -4,6 +4,9 @@ node_modules/
 # Build output
 dist/
 
+# Reference repos (used for research, not part of this project)
+claude-code-prompts/
+
 # Environment
 .env
 .env.local

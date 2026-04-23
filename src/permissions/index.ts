@@ -1,3 +1,5 @@
-export type { PermissionBehavior, PermissionRequest, PermissionContext, PermissionDecision, PermissionRule, PolicyOptions } from './types.js'
-export { DEFAULT_RULES, ALLOW_READ_ONLY, ASK_FOR_DESTRUCTIVE } from './rules.js'
+export type { PermissionBehavior, PermissionRequest, PermissionContext, PermissionDecision, PermissionRule, PolicyOptions, RiskTier } from './types.js'
+export { DEFAULT_RULES, ALLOW_READ_ONLY, ASK_FOR_DESTRUCTIVE, BLOCK_FORCE_PUSH, BLOCK_RECURSIVE_DELETE, BLOCK_DESTRUCTIVE_DB, PROTECT_ENV_FILES, CAUTION_CONFIG_WRITES } from './rules.js'
 export { PermissionPolicy } from './policy.js'
+export type { ApprovalHandler, ApprovalOutcome } from './approval.js'
+export { CliApprovalHandler, AutoApproveHandler, AutoDenyHandler } from './approval.js'

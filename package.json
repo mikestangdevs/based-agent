@@ -7,8 +7,10 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "test": "vitest run",
+    "lint": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist",
+    "test:enterprise": "tsx --env-file=.env scripts/test-enterprise.ts",
     "example:minimal": "tsx --env-file=.env examples/minimal-agent/src/index.ts",
     "example:coding": "tsx --env-file=.env examples/coding-agent/src/index.ts",
     "example:research": "tsx --env-file=.env examples/research-agent/src/index.ts",
@@ -16,7 +18,9 @@
     "template:researcher": "tsx --env-file=.env templates/researcher/src/index.ts",
     "template:codebase": "tsx --env-file=.env templates/codebase-agent/src/index.ts",
     "template:pipeline": "tsx --env-file=.env templates/pipeline-agent/src/index.ts",
-    "template:orchestrator": "tsx --env-file=.env templates/orchestrator/src/index.ts"
+    "template:orchestrator": "tsx --env-file=.env templates/orchestrator/src/index.ts",
+    "template:verify": "tsx --env-file=.env templates/verification-agent/src/index.ts"
+
   },
   "dependencies": {
     "zod": "^3.23.0"

@@ -22,6 +22,7 @@ import {
   ContextWindowManager,
   PromptBuilder,
   SubagentManager,
+  ConversationSummarizer,
   type Tool,
 } from '../../../src/index.js'
 import type { ToolContext } from '../../../src/index.js'
@@ -252,8 +253,33 @@ async function main() {
   // --- Orchestrator agent config (without tools yet — we need subagentMgr first) ---
   const orchestratorConfig: AgentConfig = {
     baseInstructions: `
-      You are a task orchestrator. You receive complex tasks and break them into focused subtasks
-      that can be completed by specialized agents. You have a \`delegate\` tool to spawn subagents.
+      You are a task orchestrator. You receive complex tasks and decompose them into focused
+      subtasks executed by specialized agents. You direct, synthesize, and verify — you are
+      the brain of the operation.
+
+      ## Your 4-Phase Workflow
+
+      ### Phase 1: Research (parallel workers)
+      Dispatch delegate calls simultaneously to gather information. Each explores independently.
+      All research tasks are read-only and safe to run concurrently.
+
+      ### Phase 2: Synthesis (YOU — not a worker)
+      This is your responsibility alone. Read every finding. Understand the problem space.
+      Identify the right approach. Craft detailed specifications for the next phase.
+      NEVER hand raw findings to another worker and say "figure it out."
+      NEVER write phrases like "based on what you discovered" — that delegates your comprehension.
+      Instead: cite specific file paths, line numbers, and exactly what needs to change.
+
+      ### Phase 3: Implementation (workers)
+      Send workers to execute the plan you synthesized. Provide them with everything they need:
+      file paths, line numbers, exact changes, success criteria. Write-heavy tasks should run
+      one at a time per file set to avoid conflicts.
+
+      ### Phase 4: Verification (workers)
+      Dispatch a reviewer to confirm correctness. Real verification means:
+      - Run the test suite with the new feature active
+      - Be skeptical — probe edge cases and failure modes
+      - Test independently — do not rubber-stamp a worker's self-assessment
 
       ## Available subagent roles
 
@@ -262,42 +288,55 @@ async function main() {
       - **reviewer**: Reviews files for issues. Good for: security audits, code review, quality checks.
       - **writer**: Produces documentation. Good for: READMEs, changelogs, API docs, summaries.
 
-      ## Your process
+      ## Worker Prompt Construction (CRITICAL)
 
-      1. **Understand the task** — Read relevant files or context to understand the current state.
-      
-      2. **Decompose** — Break it into 2-5 focused subtasks. Each subtask should:
-         - Be completable by one role without needing the others
-         - Have a clear, specific definition of done
-         - Have minimal dependencies on other subtasks
+      Workers cannot see your conversation with the user. Every prompt you write for a worker
+      must be entirely self-contained. Include:
+      - File paths and line numbers relevant to the task
+      - The exact change or finding you need
+      - What "done" looks like — concrete completion criteria
+      - For implementation tasks: include "run tests then verify" as the last step
+      - For research tasks: include "report your findings — do not modify any files"
 
-      3. **Delegate** — Call the \`delegate\` tool for each subtask. Provide:
-         - The precise subagent role
-         - A detailed, self-contained task description with all needed context
-         - The right context inheritance (usually 'none' for independent tasks)
+      ## Concurrency
 
-      4. **Aggregate** — The delegate tool returns results to you directly.
-         Synthesize the results into a coherent final response. Do not just concatenate — analyze.
+      Parallelism is your greatest advantage. Dispatch independent workers at the same time
+      whenever possible. Read-only research tasks can always run concurrently.
 
-      5. **Deliver** — Present the final synthesized result to the user.
+      ## Handling Failures
+
+      When a worker fails, the error context is in the result. Diagnose before re-delegating.
+      If a second attempt also fails, try a fundamentally different strategy.
+
+      ## Output Format
+
+      After synthesis, present:
+      - Objective and acceptance criteria
+      - Task board (role, status, what it found/did)
+      - Verified findings
+      - Decisions made and next actions
 
       ## Constraints
 
       - Do not delegate when you can do it yourself in 1-2 tool calls
-      - Each subagent runs independently — give them all context they need in the task description
+      - Each subagent runs independently — give them all context they need
       - Use inherit_context: 'none' for self-contained tasks (most cases)
-      - Use inherit_context: 'summary' when the subagent needs to know what came before
+      - Use inherit_context: 'summary' when the subagent needs prior context
       - Maximum 3 delegation depth (enforced automatically)
+      - Worker results are internal signals — synthesize them for the user, do not relay raw output
     `,
     // Tools are set below after subagentMgr is created
     tools: new ToolRegistry(),
     permissions: new PermissionPolicy(),
     memory,
-    context: new ContextWindowManager({
-      maxTokens: 200_000,
-      compactionThreshold: 0.80,
-      reservedForResponse: 12_000,
-    }),
+    context: new ContextWindowManager(
+      {
+        maxTokens: 200_000,
+        compactionThreshold: 0.80,
+        reservedForResponse: 12_000,
+      },
+      new ConversationSummarizer(model), // Hybrid compaction: summarize old, keep recent
+    ),
     prompts: new PromptBuilder(),
     model,
     maxIterations: 60,
@@ -375,7 +414,11 @@ async function main() {
           .join('')
         if (text) console.log(text)
       } else if (event.type === 'permission_denied') {
-        console.log(`  ✗ Blocked: ${event.reason}`)
+        const tier = event.riskTier ? ` [${event.riskTier.toUpperCase()} RISK]` : ''
+        console.log(`  ✗ Blocked${tier}: ${event.reason}`)
+        if (event.rollbackGuidance) {
+          console.log(`    Guidance: ${event.rollbackGuidance}`)
+        }
       } else if (event.type === 'done') {
         if (event.reason !== 'end_turn') {
           console.log(`\n[Orchestrator: ${event.reason}]`)
